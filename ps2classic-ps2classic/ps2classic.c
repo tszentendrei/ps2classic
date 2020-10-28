@@ -30,11 +30,43 @@
 #define PS2_VMC_ENCRYPT			1
 #define PS2_VMC_DECRYPT			0
 
+//types and constants (from https://raw.githubusercontent.com/PCSX2/pcsx2/2af05a92f8046a5e9151bf014a9e0a9a8375032b/pcsx2/gui/MemoryCardFolder.h)
+#pragma pack(push, 1)
+struct superblock {
+	char magic[28]; 			// 0x00
+	char version[12]; 			// 0x1c
+	u16 page_len; 				// 0x28
+	u16 pages_per_cluster;	 		// 0x2a
+	u16 pages_per_block;			// 0x2c
+	u16 unused; 				// 0x2e
+	u32 clusters_per_card;	 		// 0x30
+	u32 alloc_offset; 			// 0x34
+	u32 alloc_end; 				// 0x38
+	u32 rootdir_cluster;			// 0x3c
+	u32 backup_block1;			// 0x40
+	u32 backup_block2;			// 0x44
+	u64 padding0x48;			// 0x48
+	u32 ifc_list[32]; 			// 0x50
+	u32 bad_block_list[32]; 		// 0xd0
+	u8 card_type; 				// 0x150
+	u8 card_flags; 				// 0x151
+};
+#pragma pack(pop)
+
+static const int PageSize = 0x200;
+static const int ClusterSize = PageSize * 2;
+static const int BlockSize = ClusterSize * 8;
+static const int EccSize = 0x10;
+static const int PageSizeRaw = PageSize + EccSize;
+static const int ClusterSizeRaw = PageSizeRaw * 2;
+static const int BlockSizeRaw = ClusterSizeRaw * 8;
+
 //prototypes
 void ps2_encrypt_image(char mode[], char image_name[], char data_file[], char real_out_name[], char CID[]);
 void ps2_decrypt_image(char mode[], char image_name[], char meta_file[], char data_file[]);
-void ps2_crypt_vmc(char mode[], char vmc_path[], char vmc_out[], u8 root_key[], int crypt_mode);
+void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[], u8 root_key[], int crypt_mode);
 static void build_ps2_header(u8 * buffer, int npd_type, char content_id[], char filename[], s64 iso_size);
+void CalculateECC( u8* ecc, const u8* data );
 
 
 //keys
@@ -289,7 +321,7 @@ void ps2_encrypt_image(char mode[], char image_name[], char data_file[], char re
 	fclose(data_out);
 }
 
-void ps2_crypt_vmc(char mode[], char vmc_path[], char vmc_out[], u8 root_key[], int crypt_mode)
+void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[], u8 root_key[], int crypt_mode)
 {
 	FILE * in;
 	FILE * data_out;
@@ -303,6 +335,9 @@ void ps2_crypt_vmc(char mode[], char vmc_path[], char vmc_out[], u8 root_key[], 
 	u8 header[256];
 	u8 * data_buffer;
 	u8 * meta_buffer;
+	u8 * page_buffer;
+	u32 page_buffer_used = 0;
+	u32 data_buffer_used = 0;
 	u32 read = 0;
 
 	segment_size = PS2_DEFAULT_SEGMENT_SIZE;
@@ -311,8 +346,14 @@ void ps2_crypt_vmc(char mode[], char vmc_path[], char vmc_out[], u8 root_key[], 
 	in = fopen(vmc_path, "rb");
 	data_out = fopen(vmc_out, "wb");
 
+	//get file info
+	fseeko(in, 0, SEEK_END);
+	data_size = ftello(in);
+	fseeko(in, 0, SEEK_SET);
+
 	//alloc buffers
 	data_buffer = malloc(segment_size);
+	page_buffer = malloc(PageSizeRaw);
 
 	//generate keys
 	if(strcmp(mode, "cex") == 0)
@@ -326,27 +367,186 @@ void ps2_crypt_vmc(char mode[], char vmc_path[], char vmc_out[], u8 root_key[], 
 
 	memset(iv+8, 0, 8);
 
-	while(read = fread(data_buffer, 1, segment_size, in))
+	if(strcmp(ecc_mode, "ecc") == 0)
 	{
-		//decrypt or encrypt vmc
-		if(crypt_mode == PS2_VMC_DECRYPT)
-			aes128cbc(ps2_vmc_key, ps2_iv, data_buffer, read, data_buffer);
-		else
-			aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, read, data_buffer);
-		fwrite(data_buffer, read, 1, data_out);
+		while(read = fread(data_buffer, 1, segment_size, in))
+		{
+			//decrypt or encrypt vmc
+			if(crypt_mode == PS2_VMC_DECRYPT)
+				aes128cbc(ps2_vmc_key, ps2_iv, data_buffer, read, data_buffer);
+			else
+				aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, read, data_buffer);
+			fwrite(data_buffer, read, 1, data_out);
 
+		}
+	}else{
+		union superblock_a {
+			struct superblock data;
+			u8 raw[BlockSize];
+		};
+
+		union superblock_a * sb = NULL;
+		u32 card_size;
+		u32 card_size_raw;
+		int done = 0;
+
+		if(crypt_mode == PS2_VMC_DECRYPT)
+		{
+			while(!done && (read = fread(data_buffer, 1, segment_size, in)))
+			{
+				u32 off = 0;
+				aes128cbc(ps2_vmc_key, ps2_iv, data_buffer, read, data_buffer);
+				if(!sb)
+				{
+					if(read < sizeof(sb->data))
+						goto out;
+					sb = (union superblock_a *)data_buffer;
+					if(sb->raw[0x16] != 0x6F)
+						goto out;
+					if(sb->data.page_len != PageSize)
+						goto out;
+					card_size = sb->data.page_len * sb->data.pages_per_cluster * sb->data.clusters_per_card;
+					card_size_raw = card_size / PageSize * PageSizeRaw;
+					if(data_size < (int)card_size_raw)
+						goto out;
+
+				}
+				if(read < PageSizeRaw - page_buffer_used)
+					goto out;
+				memcpy(page_buffer + page_buffer_used, data_buffer, PageSizeRaw - page_buffer_used);
+				off += PageSizeRaw - page_buffer_used;
+				read -= PageSizeRaw - page_buffer_used;
+				fwrite(page_buffer, PageSize, 1, data_out);
+				if(ftello(data_out) >= card_size)
+					done = 1;
+				while(!done && read >= PageSizeRaw)
+				{
+					fwrite(data_buffer + off, PageSize, 1, data_out);
+					off += PageSizeRaw;
+					read -= PageSizeRaw;
+					if(ftello(data_out) >= card_size)
+						done = 1;
+				}
+				if(!done && read)
+					memcpy(page_buffer, data_buffer + off, read);
+				page_buffer_used = read;
+			}
+		}else{
+			while(read = fread(page_buffer, 1, PageSize, in))
+			{
+				u32 off;
+				int empty = 1;
+				if(!sb)
+				{
+					if(read < sizeof(sb->data))
+						goto out;
+					sb = (union superblock_a *)page_buffer;
+					if(sb->raw[0x16] != 0x6F)
+						goto out;
+					if(sb->data.page_len != PageSize)
+						goto out;
+					card_size = sb->data.page_len * sb->data.pages_per_cluster * sb->data.clusters_per_card;
+					card_size_raw = card_size / PageSize * PageSizeRaw;
+					if(data_size != (int)card_size)
+						goto out;
+				}
+				if(read < PageSize)
+					goto out;
+				for(off = 0; off < PageSize; off++)
+				{
+					if(page_buffer[off] != 0xFF) {
+						empty = 0;
+						break;
+					}
+				}
+				if(!empty)
+				{
+					memset(page_buffer + PageSize, 0, EccSize);
+					for(off = 0; off < PageSize; off += 0x80)
+					{
+						CalculateECC(page_buffer + PageSize + (off / 0x80 * 3), page_buffer + off);
+					}
+				}
+				else
+					memset(page_buffer + PageSize, 0xFF, EccSize);
+				if(segment_size - data_buffer_used < PageSizeRaw)
+				{
+					memcpy(data_buffer + data_buffer_used, page_buffer, segment_size - data_buffer_used);
+					aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, segment_size, data_buffer);
+					fwrite(data_buffer, segment_size, 1, data_out);
+					data_buffer_used = PageSizeRaw - (segment_size - data_buffer_used);
+					memcpy(data_buffer, page_buffer + PageSizeRaw - data_buffer_used, data_buffer_used);
+				}
+				else
+				{
+					memcpy(data_buffer + data_buffer_used, page_buffer, PageSizeRaw);
+					data_buffer_used += PageSizeRaw;
+				}
+
+			}
+			if(data_buffer_used)
+			{
+				aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, data_buffer_used, data_buffer);
+				fwrite(data_buffer, data_buffer_used, 1, data_out);
+			}
+		}
 	}
 
+out:
 	//cleanup
 	free(data_buffer);
+	free(page_buffer);
 
 	fclose(in);
 	fclose(data_out);
 
 }
 
+// from http://www.oocities.org/siliconvalley/station/8269/sma02/sma02.html#ECC
+void CalculateECC( u8* ecc, const u8* data ) {
+	static const u8 Table[] = {
+		0x00, 0x87, 0x96, 0x11, 0xa5, 0x22, 0x33, 0xb4, 0xb4, 0x33, 0x22, 0xa5, 0x11, 0x96, 0x87, 0x00,
+		0xc3, 0x44, 0x55, 0xd2, 0x66, 0xe1, 0xf0, 0x77, 0x77, 0xf0, 0xe1, 0x66, 0xd2, 0x55, 0x44, 0xc3,
+		0xd2, 0x55, 0x44, 0xc3, 0x77, 0xf0, 0xe1, 0x66, 0x66, 0xe1, 0xf0, 0x77, 0xc3, 0x44, 0x55, 0xd2,
+		0x11, 0x96, 0x87, 0x00, 0xb4, 0x33, 0x22, 0xa5, 0xa5, 0x22, 0x33, 0xb4, 0x00, 0x87, 0x96, 0x11,
+		0xe1, 0x66, 0x77, 0xf0, 0x44, 0xc3, 0xd2, 0x55, 0x55, 0xd2, 0xc3, 0x44, 0xf0, 0x77, 0x66, 0xe1,
+		0x22, 0xa5, 0xb4, 0x33, 0x87, 0x00, 0x11, 0x96, 0x96, 0x11, 0x00, 0x87, 0x33, 0xb4, 0xa5, 0x22,
+		0x33, 0xb4, 0xa5, 0x22, 0x96, 0x11, 0x00, 0x87, 0x87, 0x00, 0x11, 0x96, 0x22, 0xa5, 0xb4, 0x33,
+		0xf0, 0x77, 0x66, 0xe1, 0x55, 0xd2, 0xc3, 0x44, 0x44, 0xc3, 0xd2, 0x55, 0xe1, 0x66, 0x77, 0xf0,
+		0xf0, 0x77, 0x66, 0xe1, 0x55, 0xd2, 0xc3, 0x44, 0x44, 0xc3, 0xd2, 0x55, 0xe1, 0x66, 0x77, 0xf0,
+		0x33, 0xb4, 0xa5, 0x22, 0x96, 0x11, 0x00, 0x87, 0x87, 0x00, 0x11, 0x96, 0x22, 0xa5, 0xb4, 0x33,
+		0x22, 0xa5, 0xb4, 0x33, 0x87, 0x00, 0x11, 0x96, 0x96, 0x11, 0x00, 0x87, 0x33, 0xb4, 0xa5, 0x22,
+		0xe1, 0x66, 0x77, 0xf0, 0x44, 0xc3, 0xd2, 0x55, 0x55, 0xd2, 0xc3, 0x44, 0xf0, 0x77, 0x66, 0xe1,
+		0x11, 0x96, 0x87, 0x00, 0xb4, 0x33, 0x22, 0xa5, 0xa5, 0x22, 0x33, 0xb4, 0x00, 0x87, 0x96, 0x11,
+		0xd2, 0x55, 0x44, 0xc3, 0x77, 0xf0, 0xe1, 0x66, 0x66, 0xe1, 0xf0, 0x77, 0xc3, 0x44, 0x55, 0xd2,
+		0xc3, 0x44, 0x55, 0xd2, 0x66, 0xe1, 0xf0, 0x77, 0x77, 0xf0, 0xe1, 0x66, 0xd2, 0x55, 0x44, 0xc3,
+		0x00, 0x87, 0x96, 0x11, 0xa5, 0x22, 0x33, 0xb4, 0xb4, 0x33, 0x22, 0xa5, 0x11, 0x96, 0x87, 0x00
+	};
 
+	int i, c;
 
+	ecc[0] = ecc[1] = ecc[2] = 0;
+
+	for ( i = 0; i < 0x80; i++ ) {
+		c = Table[data[i]];
+
+		ecc[0] ^= c;
+		if ( c & 0x80 ) {
+			ecc[1] ^= ~i;
+			ecc[2] ^= i;
+		}
+	}
+	ecc[0] = ~ecc[0];
+	ecc[0] &= 0x77;
+
+	ecc[1] = ~ecc[1];
+	ecc[1] &= 0x7f;
+
+	ecc[2] = ~ecc[2];
+	ecc[2] &= 0x7f;
+
+	return;
+}
 
 int main(int argc, char *argv[])
 {
@@ -360,8 +560,8 @@ int main(int argc, char *argv[])
 	{
 		printf("usage:\n\tiso:\n\t\t%s d [cex/dex] [klicensee] [encrypted image] [out data] [out meta]\n", argv[0]);
 		printf("\t\t%s e [cex/dex] [klicensee] [iso] [out data] [real out name] [CID]\n", argv[0]);
-		printf("\t\nvmc:\n\t\t%s vd [cex/dex] [vme file] [out vmc] [(eid root key)]\n", argv[0]);
-		printf("\t\t%s ve [cex/dex] [vmc file] [out vme] [(eid root key)]\n", argv[0]);
+		printf("\t\nvmc:\n\t\t%s vd [cex/dex] [ecc/noecc] [vme file] [out vmc] [(eid root key)]\n", argv[0]);
+		printf("\t\t%s ve [cex/dex] [ecc/noecc] [vmc file] [out vme] [(eid root key)]\n", argv[0]);
 		printf("\t\nimage tools:\n\t\t%s prepare [image file]\n", argv[0]);
 		printf("\t\t%s info [image file]\n", argv[0]);
 		exit(0);
@@ -382,9 +582,9 @@ int main(int argc, char *argv[])
 			printf("Error: invalid number of arguments for encryption\n");
 	else if(strcmp(argv[1], "vd") == 0 || strcmp(argv[1], "ve") == 0)
 	{
-		if(argc == 6)
+		if(argc == 7)
 			root_key = mmap_file(argv[3]);
-		else if(argc == 5){
+		else if(argc == 6){
 			root_key = malloc(0x30);
 			memset(root_key, 0, 0x30);
 		}else{
@@ -393,9 +593,9 @@ int main(int argc, char *argv[])
 		}
 
 		if(strcmp(argv[1], "vd") == 0)
-			ps2_crypt_vmc(argv[2], argv[3], argv[4], root_key, PS2_VMC_DECRYPT);
+			ps2_crypt_vmc(argv[2], argv[3], argv[4], argv[5], root_key, PS2_VMC_DECRYPT);
 		else
-			ps2_crypt_vmc(argv[2], argv[3], argv[4], root_key, PS2_VMC_ENCRYPT);
+			ps2_crypt_vmc(argv[2], argv[3], argv[4], argv[5], root_key, PS2_VMC_ENCRYPT);
 
 		free(root_key);
 	}

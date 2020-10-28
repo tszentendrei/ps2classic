@@ -15,14 +15,6 @@ typedef int16_t s16;
 typedef uint8_t u8;
 typedef int8_t s8;
 
-
-#ifdef WIN32
-	#define ftello	ftello64
-	#define fseeko	fseeko64
-#endif
-
-
-
 static inline u8 be8(u8 *p)
 {
 	return *p;
