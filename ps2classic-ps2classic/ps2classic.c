@@ -26,6 +26,7 @@
 #define PS2_DATA_SEGMENT_START		2
 #define PS2_DEFAULT_SEGMENT_SIZE	0x4000
 #define PS2_META_ENTRY_SIZE		0x20
+#define PS2_HASH_ENTRY_SIZE		0x14
 
 #define PS2_VMC_ENCRYPT			1
 #define PS2_VMC_DECRYPT			0
@@ -334,10 +335,11 @@ void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[]
 	int i;
 	u8 header[256];
 	u8 * data_buffer;
-	u8 * meta_buffer;
+	u8 * hash_buffer;
 	u8 * page_buffer;
 	u32 page_buffer_used = 0;
 	u32 data_buffer_used = 0;
+	u32 hash_buffer_used = 0;
 	u32 read = 0;
 
 	segment_size = PS2_DEFAULT_SEGMENT_SIZE;
@@ -354,6 +356,7 @@ void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[]
 	//alloc buffers
 	data_buffer = malloc(segment_size);
 	page_buffer = malloc(PageSizeRaw);
+	hash_buffer = malloc(segment_size);
 
 	//generate keys
 	if(strcmp(mode, "cex") == 0)
@@ -432,6 +435,7 @@ void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[]
 				page_buffer_used = read;
 			}
 		}else{
+			memset(hash_buffer, 0, segment_size);
 			while(read = fread(page_buffer, 1, PageSize, in))
 			{
 				u32 off;
@@ -472,6 +476,8 @@ void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[]
 				if(segment_size - data_buffer_used < PageSizeRaw)
 				{
 					memcpy(data_buffer + data_buffer_used, page_buffer, segment_size - data_buffer_used);
+					sha1(data_buffer, segment_size, hash_buffer + hash_buffer_used);
+					hash_buffer_used += PS2_HASH_ENTRY_SIZE;
 					aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, segment_size, data_buffer);
 					fwrite(data_buffer, segment_size, 1, data_out);
 					data_buffer_used = PageSizeRaw - (segment_size - data_buffer_used);
@@ -486,9 +492,13 @@ void ps2_crypt_vmc(char mode[], char ecc_mode[], char vmc_path[], char vmc_out[]
 			}
 			if(data_buffer_used)
 			{
+				sha1(data_buffer, data_buffer_used, hash_buffer + hash_buffer_used);
+				hash_buffer_used += PS2_HASH_ENTRY_SIZE;
 				aes128cbc_enc(ps2_vmc_key, ps2_iv, data_buffer, data_buffer_used, data_buffer);
 				fwrite(data_buffer, data_buffer_used, 1, data_out);
 			}
+			aes128cbc_enc(ps2_vmc_key, ps2_iv, hash_buffer, segment_size, hash_buffer);
+			fwrite(hash_buffer, segment_size, 1, data_out);
 		}
 	}
 
